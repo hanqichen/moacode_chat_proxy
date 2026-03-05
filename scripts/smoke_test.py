@@ -4,15 +4,16 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from typing import Dict, Tuple
 
 
-def http_get(url: str, timeout: int) -> tuple[int, str]:
+def http_get(url: str, timeout: int) -> Tuple[int, str]:
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         body = resp.read().decode("utf-8", errors="replace")
         return resp.status, body
 
 
-def http_post_json(url: str, payload: dict, timeout: int, api_key: str) -> tuple[int, str]:
+def http_post_json(url: str, payload: Dict, timeout: int, api_key: str) -> Tuple[int, str]:
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
