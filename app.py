@@ -24,6 +24,7 @@ SUPPORTED_TOP_LEVEL_CACHE_FIELDS = {
 DEFAULT_AUTO_PROMPT_CACHE_PREFIX_CHARS = 4096
 DEFAULT_AUTO_PROMPT_CACHE_MIN_MESSAGES = 6
 DEFAULT_AUTO_PROMPT_CACHE_UA_SEGMENTS = 6
+DEFAULT_UPSTREAM_TRUST_ENV = False
 
 
 def _mask_token(token: str) -> str:
@@ -155,6 +156,10 @@ def _is_enabled_env(var_name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "off", "no", ""}
+
+
+def _upstream_trust_env() -> bool:
+    return _is_enabled_env("UPSTREAM_TRUST_ENV", default=DEFAULT_UPSTREAM_TRUST_ENV)
 
 
 def map_usage(input_text: str, output_text: str, upstream_usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -430,14 +435,14 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
     try:
         timeout = httpx.Timeout(connect=30.0, read=30.0, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=_upstream_trust_env()) as client:
             resp = await client.post(f"{MOACODE_BASE_URL}/responses", json=upstream_payload, headers=headers)
     except Exception as exc:
         error_detail = {
             "error": {
                 "message": "Upstream request failed",
                 "upstream_status": None,
-                "upstream_body": str(exc)[:2048],
+                "upstream_body": f"{exc.__class__.__name__}: {str(exc) or repr(exc)}"[:2048],
             }
         }
         return JSONResponse(status_code=502, content=error_detail)
@@ -517,4 +522,5 @@ if __name__ == "__main__":
     token = get_upstream_token()
     print(f"[startup] auth_json_path={get_auth_json_path()}")
     print(f"[startup] token_loaded={bool(token)} token={_mask_token(token)}")
+    print(f"[startup] upstream_trust_env={_upstream_trust_env()}")
     uvicorn.run(app, host="0.0.0.0", port=args.port)
