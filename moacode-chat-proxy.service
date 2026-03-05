@@ -1,0 +1,16 @@
+[Unit]
+Description=Moacode Chat Completions to Responses Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/moacode_chat_proxy
+Environment=PORT=5102
+Environment=CODEX_AUTH_JSON_PATH=/root/.codex/auth.json
+ExecStart=/root/moacode_chat_proxy/.venv/bin/python /root/moacode_chat_proxy/app.py --auth-json-path /root/.codex/auth.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
