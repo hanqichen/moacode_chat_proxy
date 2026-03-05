@@ -29,13 +29,26 @@ python -m pip install -r requirements.txt
 ## 3) 启动服务
 
 ```powershell
-$env:PORT="5102"
-python .\app.py --auth-json-path "$env:USERPROFILE\.codex\auth.json"
+cd D:\Program\2026\moacode_chat_proxy
+python .\app.py --auth-json-path "C:\Users\你的用户名\.codex\auth.jsonl"
 ```
+
+`auth.jsonl` 路径通常在用户目录下的 `.codex` 文件夹内，大致位置是：
+
+- `C:\Users\你的用户名\.codex\auth.jsonl`
+
+如果你不确定用户名，也可以先在 PowerShell 里执行 `echo $env:USERPROFILE` 查看用户目录。
 
 ## 4) 验证是否成功
 
-新开一个 PowerShell（同样先激活 `.venv`）后执行：
+新开一个 PowerShell 后，先执行下面两条命令进入项目并激活虚拟环境：
+
+```powershell
+cd D:\Program\2026\moacode_chat_proxy
+.\.venv\Scripts\Activate.ps1
+```
+
+然后执行自测脚本：
 
 ```powershell
 python .\scripts\smoke_test.py
@@ -48,4 +61,3 @@ python .\scripts\smoke_test.py --api-key 你的INBOUND_BEARER
 ```
 
 看到 `[OK] 代理测试通过` 即表示安装与启动成功。
-
