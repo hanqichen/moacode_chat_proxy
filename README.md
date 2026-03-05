@@ -20,7 +20,10 @@
   - 启动参数：`--auth-json-path /path/to/auth.json`
   - 环境变量：`CODEX_AUTH_JSON_PATH=/path/to/auth.json`
 - 可选入站鉴权：`INBOUND_BEARER`（默认关闭）
-- 自动透传 Chat Completions 请求里的缓存参数（字段名包含 `cache`）到上游 Responses API
+- 自动透传已支持的顶层缓存参数（当前：`prompt_cache_key`、`enable_caching`）到上游 Responses API
+- 若请求未携带 `prompt_cache_key`，代理会自动注入稳定 key（可关闭）：
+  - 基于 `system` 前缀（默认前 4096 字符）+ 前 6 条 `user/assistant` 片段（含 assistant 的 `tool_calls` 名称与参数）
+  - 仅当 `user/assistant` 消息累计到 6 条后才注入（默认）
 
 ## 3) 安装与启动文档
 
@@ -86,6 +89,9 @@ sudo systemctl restart moacode-chat-proxy
 - `MOACODE_API_KEY`：上游 key（最高优先级）
 - `CODEX_AUTH_JSON_PATH`：`auth.json` 路径（例如 `/root/.codex/auth.json`）
 - `INBOUND_BEARER`：开启入站鉴权时使用
+- `AUTO_PROMPT_CACHE_KEY`：是否自动注入 `prompt_cache_key`（默认 `1`，设 `0` 关闭）
+- `AUTO_PROMPT_CACHE_KEY_PREFIX_CHARS`：自动 key 使用的前缀字符数（默认 `4096`）
+- `AUTO_PROMPT_CACHE_MIN_MESSAGES`：自动注入前要求的 `user/assistant` 消息数（默认 `6`）
 
 入站鉴权示例（可选）：
 

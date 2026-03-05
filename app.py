@@ -1,20 +1,29 @@
 import argparse
+import hashlib
 import json
 import os
 import time
 import uuid
 from pathlib import Path
+from typing import Iterator
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 MOACODE_BASE_URL = "https://moacode.org/v1"
 DEFAULT_AUTH_JSON_PATH = Path.home() / ".codex" / "auth.json"
 AUTH_JSON_PATH_OVERRIDE: Optional[Path] = None
 
 app = FastAPI(title="Moacode Chat->Responses Proxy", version="0.1.0")
+SUPPORTED_TOP_LEVEL_CACHE_FIELDS = {
+    "prompt_cache_key",
+    "enable_caching",
+}
+DEFAULT_AUTO_PROMPT_CACHE_PREFIX_CHARS = 4096
+DEFAULT_AUTO_PROMPT_CACHE_MIN_MESSAGES = 6
+DEFAULT_AUTO_PROMPT_CACHE_UA_SEGMENTS = 6
 
 
 def _mask_token(token: str) -> str:
@@ -134,16 +143,52 @@ def extract_output_text(resp_json: Dict[str, Any]) -> str:
     return json.dumps(resp_json, ensure_ascii=False)
 
 
-def map_usage(input_text: str, output_text: str, upstream_usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_enabled_env(var_name: str, default: bool = False) -> bool:
+    raw = os.getenv(var_name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no", ""}
+
+
+def map_usage(input_text: str, output_text: str, upstream_usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if isinstance(upstream_usage, dict):
-        prompt_tokens = int(upstream_usage.get("input_tokens") or upstream_usage.get("prompt_tokens") or 0)
-        completion_tokens = int(upstream_usage.get("output_tokens") or upstream_usage.get("completion_tokens") or 0)
-        total_tokens = int(upstream_usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-        return {
+        prompt_tokens = _safe_int(upstream_usage.get("input_tokens") or upstream_usage.get("prompt_tokens") or 0)
+        completion_tokens = _safe_int(upstream_usage.get("output_tokens") or upstream_usage.get("completion_tokens") or 0)
+        total_tokens = _safe_int(upstream_usage.get("total_tokens"), prompt_tokens + completion_tokens)
+
+        usage: Dict[str, Any] = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
         }
+        prompt_details = upstream_usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = upstream_usage.get("input_tokens_details")
+        if isinstance(prompt_details, dict):
+            usage["prompt_tokens_details"] = prompt_details
+
+        completion_details = upstream_usage.get("completion_tokens_details")
+        if not isinstance(completion_details, dict):
+            completion_details = upstream_usage.get("output_tokens_details")
+        if isinstance(completion_details, dict):
+            usage["completion_tokens_details"] = completion_details
+
+        cached_tokens = upstream_usage.get("cached_tokens")
+        if cached_tokens is not None:
+            details = usage.get("prompt_tokens_details", {})
+            if isinstance(details, dict):
+                details = dict(details)
+                details.setdefault("cached_tokens", _safe_int(cached_tokens))
+                usage["prompt_tokens_details"] = details
+
+        return usage
 
     prompt_tokens = max(1, len(input_text) // 4) if input_text else 0
     completion_tokens = max(1, len(output_text) // 4) if output_text else 0
@@ -154,13 +199,188 @@ def map_usage(input_text: str, output_text: str, upstream_usage: Optional[Dict[s
     }
 
 
+def pass_through_cache_params(chat_body: Dict[str, Any], upstream_payload: Dict[str, Any]) -> None:
+    # Keep this intentionally narrow: only forward known top-level cache knobs.
+    for key in SUPPORTED_TOP_LEVEL_CACHE_FIELDS:
+        if key in chat_body:
+            upstream_payload[key] = chat_body[key]
+
+
+def _normalize_cache_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _canonicalize_tool_arguments(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        arguments_text = arguments.strip()
+        if not arguments_text:
+            return ""
+        try:
+            parsed = json.loads(arguments_text)
+            return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            return _normalize_cache_text(arguments_text)
+    if isinstance(arguments, (dict, list)):
+        return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if arguments is None:
+        return ""
+    return _normalize_cache_text(str(arguments))
+
+
+def _build_system_prefix_for_cache(messages: List[Dict[str, Any]], prefix_chars: int) -> str:
+    system_parts: List[str] = []
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = _normalize_cache_text(_content_to_text(msg.get("content", "")))
+        if content:
+            system_parts.append(content)
+    return "\n".join(system_parts)[:prefix_chars]
+
+
+def _build_ua_segments_for_cache(messages: List[Dict[str, Any]], max_segments: int) -> List[str]:
+    segments: List[str] = []
+    for msg in messages:
+        role = str(msg.get("role", ""))
+        if role not in {"user", "assistant"}:
+            continue
+
+        parts: List[str] = []
+        content = _normalize_cache_text(_content_to_text(msg.get("content", "")))
+        if content:
+            parts.append(content)
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                call_parts: List[str] = []
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    name = _normalize_cache_text(str(fn.get("name", "")))
+                    args = _canonicalize_tool_arguments(fn.get("arguments"))
+                    if name and args:
+                        call_parts.append(f"{name}({args})")
+                    elif name:
+                        call_parts.append(name)
+                if call_parts:
+                    parts.append("tool_calls:" + "|".join(call_parts))
+
+        if not parts:
+            continue
+
+        segments.append(f"{role}:{' '.join(parts)}")
+        if len(segments) >= max_segments:
+            break
+    return segments
+
+
+def maybe_inject_prompt_cache_key(upstream_payload: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
+    # Keep behavior simple: caller key always wins; auto mode only fills missing key.
+    if upstream_payload.get("prompt_cache_key"):
+        return
+    if not _is_enabled_env("AUTO_PROMPT_CACHE_KEY", default=True):
+        return
+
+    prefix_chars = _safe_int(
+        os.getenv("AUTO_PROMPT_CACHE_KEY_PREFIX_CHARS"),
+        DEFAULT_AUTO_PROMPT_CACHE_PREFIX_CHARS,
+    )
+    if prefix_chars <= 0:
+        prefix_chars = DEFAULT_AUTO_PROMPT_CACHE_PREFIX_CHARS
+
+    min_messages = _safe_int(
+        os.getenv("AUTO_PROMPT_CACHE_MIN_MESSAGES"),
+        DEFAULT_AUTO_PROMPT_CACHE_MIN_MESSAGES,
+    )
+    if min_messages <= 0:
+        min_messages = DEFAULT_AUTO_PROMPT_CACHE_MIN_MESSAGES
+
+    ua_message_count = sum(1 for msg in messages if str(msg.get("role", "")) in {"user", "assistant"})
+    if ua_message_count < min_messages:
+        return
+
+    system_prefix = _build_system_prefix_for_cache(messages, prefix_chars)
+    ua_segments = _build_ua_segments_for_cache(messages, DEFAULT_AUTO_PROMPT_CACHE_UA_SEGMENTS)
+    if not system_prefix and not ua_segments:
+        return
+
+    key_parts = [f"model={upstream_payload.get('model', '')}", f"system={system_prefix}"]
+    for idx, segment in enumerate(ua_segments, start=1):
+        key_parts.append(f"ua{idx}={segment}")
+    key_material = "\n".join(key_parts)
+    digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+    upstream_payload["prompt_cache_key"] = f"auto-pck-v2-{digest[:48]}"
+
+
+def stream_chat_completion_response(
+    completion_id: str,
+    created: int,
+    model: str,
+    assistant_text: str,
+    usage: Dict[str, Any],
+    include_usage: bool,
+) -> Iterator[bytes]:
+    def _event(payload: Dict[str, Any]) -> bytes:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    # Start chunk announces role, then content, then finish reason.
+    yield _event(
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+    )
+
+    if assistant_text:
+        yield _event(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": assistant_text}, "finish_reason": None}],
+            }
+        )
+
+    yield _event(
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+    )
+
+    if include_usage:
+        yield _event(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+        )
+
+    yield b"data: [DONE]\n\n"
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)) -> JSONResponse:
+async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)) -> Any:
     inbound_bearer = os.getenv("INBOUND_BEARER")
     if inbound_bearer:
         if not authorization or not authorization.startswith("Bearer "):
@@ -173,8 +393,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
     model = body.get("model")
     messages = body.get("messages")
+    stream = bool(body.get("stream"))
+    stream_options = body.get("stream_options")
+    include_usage = isinstance(stream_options, dict) and bool(stream_options.get("include_usage"))
     if not model or not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="model and messages are required")
+    if any(not isinstance(msg, dict) for msg in messages):
+        raise HTTPException(status_code=400, detail="each message must be an object")
 
     input_text = messages_to_input(messages)
 
@@ -189,6 +414,10 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         upstream_payload["top_p"] = body["top_p"]
     if "max_tokens" in body:
         upstream_payload["max_output_tokens"] = body["max_tokens"]
+    if "max_completion_tokens" in body:
+        upstream_payload["max_output_tokens"] = body["max_completion_tokens"]
+    pass_through_cache_params(body, upstream_payload)
+    maybe_inject_prompt_cache_key(upstream_payload, messages)
 
     upstream_token = get_upstream_token()
     if not upstream_token:
@@ -247,6 +476,20 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         ],
         "usage": usage,
     }
+
+    if stream:
+        return StreamingResponse(
+            stream_chat_completion_response(
+                completion_id=completion_id,
+                created=created,
+                model=resp_json.get("model") or model,
+                assistant_text=assistant_text,
+                usage=usage,
+                include_usage=include_usage,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     return JSONResponse(status_code=200, content=chat_resp)
 
